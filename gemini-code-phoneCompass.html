@@ -1,0 +1,220 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0, user-scalable=no">
+    <title>Directional Security Radar</title>
+    <script src="https://unpkg.com/mqtt/dist/mqtt.min.js"></script>
+    <style>
+        :root {
+            --bg: #090d16;
+            --surface: #131b2e;
+            --cyan: #06b6d4;
+            --red: #ef4444;
+            --green: #10b981;
+        }
+        body {
+            margin: 0;
+            background: var(--bg);
+            color: #f1f5f9;
+            font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
+            display: flex;
+            flex-direction: column;
+            align-items: center;
+            padding: 16px;
+        }
+        header { width: 100%; max-width: 400px; display: flex; justify-content: space-between; align-items: center; margin-bottom: 15px; }
+        .pill { font-size: 0.8rem; padding: 4px 10px; border-radius: 12px; background: #022c22; color: #34d399; }
+        
+        /* Sonar Radar Screen */
+        .radar-box {
+            position: relative;
+            width: 300px;
+            height: 300px;
+            border-radius: 50%;
+            border: 2px solid var(--cyan);
+            background: radial-gradient(circle, rgba(6,182,212,0.1) 0%, rgba(9,13,22,0.9) 100%);
+            overflow: hidden;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+        }
+        .ring { position: absolute; border: 1px dashed rgba(6,182,212,0.3); border-radius: 50%; }
+        .cross-h { position: absolute; width: 100%; height: 1px; background: rgba(6,182,212,0.2); }
+        .cross-v { position: absolute; height: 100%; width: 1px; background: rgba(6,182,212,0.2); }
+        
+        /* 45° Aperture Arc Indicator */
+        .cone {
+            position: absolute;
+            top: 0; left: 0; width: 100%; height: 100%;
+            background: conic-gradient(from -22.5deg, rgba(6, 182, 212, 0.35) 0deg, transparent 45deg, transparent 360deg);
+            border-radius: 50%;
+            pointer-events: none;
+        }
+
+        /* Directional Target Arrow */
+        .arrow-pointer {
+            position: absolute;
+            width: 0; height: 0;
+            border-left: 12px solid transparent;
+            border-right: 12px solid transparent;
+            border-bottom: 28px solid var(--red);
+            top: 20px;
+            transform-origin: 50% 130px;
+            transition: transform 0.15s ease-out;
+            filter: drop-shadow(0 0 8px var(--red));
+        }
+
+        .stats {
+            width: 100%;
+            max-width: 400px;
+            margin-top: 20px;
+            display: grid;
+            grid-template-columns: 1fr 1fr;
+            gap: 10px;
+        }
+        .card { background: var(--surface); padding: 12px; border-radius: 8px; border: 1px solid #23304b; text-align: center; }
+        .label { font-size: 0.75rem; color: #94a3b8; }
+        .value { font-size: 1.2rem; font-weight: bold; margin-top: 4px; }
+        .btn-permission {
+            margin-top: 15px;
+            background: linear-gradient(135deg, var(--cyan), #2563eb);
+            color: white;
+            border: none;
+            padding: 10px 20px;
+            border-radius: 20px;
+            font-weight: bold;
+        }
+    </style>
+</head>
+<body>
+
+    <header>
+        <div style="font-weight: 800;">DIRECTIONAL RADAR</div>
+        <div class="pill" id="mqttStatus">Connecting...</div>
+    </header>
+
+    <div class="radar-box">
+        <div class="ring" style="width: 100px; height: 100px;"></div>
+        <div class="ring" style="width: 200px; height: 200px;"></div>
+        <div class="cross-h"></div>
+        <div class="cross-v"></div>
+        <div class="cone"></div>
+        <div class="arrow-pointer" id="bearingArrow"></div>
+    </div>
+
+    <button class="btn-permission" id="btnPerm" onclick="requestCompass()">Calibrate Compass</button>
+
+    <div class="stats">
+        <div class="card">
+            <div class="label">Facing Heading</div>
+            <div class="value" id="headingVal">0°</div>
+        </div>
+        <div class="card">
+            <div class="label">Target Bearing</div>
+            <div class="value" id="bearingVal" style="color: var(--red);">--°</div>
+        </div>
+        <div class="card">
+            <div class="label">Live Signal (RSSI)</div>
+            <div class="value" id="rssiVal">-- dBm</div>
+        </div>
+        <div class="card">
+            <div class="label">Est. Distance</div>
+            <div class="value" id="distVal" style="color: var(--cyan);">-- m</div>
+        </div>
+    </div>
+
+    <script>
+        let currentHeading = 0;
+        let bestBearing = 0;
+        let maxRssiObserved = -120;
+        
+        // 8 Directional Sectors (45° bins: 0, 45, 90, 135, 180, 225, 270, 315)
+        const sectorSignalMap = new Array(8).fill(-120);
+
+        // 1. MQTT Connection over Secure WebSockets
+        const client = mqtt.connect('wss://broker.hivemq.com:8884/mqtt', {
+            clientId: 'PhoneRadar_' + Math.random().toString(16).substr(2, 8),
+            keepalive: 30
+        });
+
+        client.on('connect', () => {
+            document.getElementById('mqttStatus').innerText = "Telemetry Online";
+            client.subscribe('themepark/security/data');
+        });
+
+        client.on('message', (topic, payload) => {
+            try {
+                const data = JSON.parse(payload.toString());
+                const rawRssi = data.rssi;
+                document.getElementById('rssiVal').innerText = `${rawRssi} dBm`;
+                document.getElementById('distVal').innerText = `${data.dist} m`;
+
+                if (rawRssi > -95) {
+                    // Map current compass heading to a 45° sector index (0 to 7)
+                    const sectorIndex = Math.floor(((currentHeading + 22.5) % 360) / 45);
+                    
+                    // Smooth sector RSSI using exponential moving average
+                    sectorSignalMap[sectorIndex] = (sectorSignalMap[sectorIndex] * 0.6) + (rawRssi * 0.4);
+
+                    // Determine bearing of the strongest sector
+                    let highestVal = -120;
+                    let peakSector = 0;
+                    for (let i = 0; i < 8; i++) {
+                        if (sectorSignalMap[i] > highestVal) {
+                            highestVal = sectorSignalMap[i];
+                            peakSector = i;
+                        }
+                    }
+
+                    bestBearing = peakSector * 45;
+                    document.getElementById('bearingVal').innerText = `${bestBearing}°`;
+
+                    // Update pointer arrow relative to phone's current facing direction
+                    const relativeAngle = (bestBearing - currentHeading + 360) % 360;
+                    document.getElementById('bearingArrow').style.transform = `rotate(${relativeAngle}deg)`;
+                }
+            } catch (e) {
+                console.error("Payload error", e);
+            }
+        });
+
+        // 2. Access Phone Compass via DeviceOrientation API
+        function requestCompass() {
+            if (typeof DeviceOrientationEvent !== 'undefined' && 
+                typeof DeviceOrientationEvent.requestPermission === 'function') {
+                // iOS 13+ permission request
+                DeviceOrientationEvent.requestPermission()
+                    .then(response => {
+                        if (response === 'granted') {
+                            window.addEventListener('deviceorientation', handleOrientation, true);
+                            document.getElementById('btnPerm').style.display = 'none';
+                        }
+                    })
+                    .catch(console.error);
+            } else {
+                // Android & standard browsers
+                window.addEventListener('deviceorientationabsolute', handleOrientation, true);
+                window.addEventListener('deviceorientation', handleOrientation, true);
+                document.getElementById('btnPerm').style.display = 'none';
+            }
+        }
+
+        function handleOrientation(e) {
+            let compass = 0;
+            if (e.webkitCompassHeading) {
+                compass = e.webkitCompassHeading; // iOS non-standard heading
+            } else if (e.alpha !== null) {
+                compass = (360 - e.alpha) % 360;   // Android heading (compass inversion)
+            }
+
+            currentHeading = Math.round(compass);
+            document.getElementById('headingVal').innerText = `${currentHeading}°`;
+
+            // Adjust relative pointer rotation during live heading changes
+            const relativeAngle = (bestBearing - currentHeading + 360) % 360;
+            document.getElementById('bearingArrow').style.transform = `rotate(${relativeAngle}deg)`;
+        }
+    </script>
+</body>
+</html>
