@@ -200,18 +200,31 @@
             }
         }
 
+        let smoothedHeading = 0;
+
         function handleOrientation(e) {
-            let compass = 0;
-            if (e.webkitCompassHeading) {
-                compass = e.webkitCompassHeading; // iOS non-standard heading
-            } else if (e.alpha !== null) {
-                compass = (360 - e.alpha) % 360;   // Android heading (compass inversion)
+            let rawCompass = 0;
+        
+            // iOS Safari
+            if (e.webkitCompassHeading !== undefined) {
+                rawCompass = e.webkitCompassHeading;
+            } 
+            // Android Chrome (alpha represents absolute rotation when event is absolute)
+            else if (e.alpha !== null) {
+                rawCompass = (360 - e.alpha) % 360;
             }
-
-            currentHeading = Math.round(compass);
+        
+            // Low-Pass Filter to eliminate jitter (smooths sudden jumps)
+            // Handle 359° -> 0° wrap-around math cleanly
+            let diff = rawCompass - smoothedHeading;
+            if (diff > 180)  diff -= 360;
+            if (diff < -180) diff += 360;
+            smoothedHeading = (smoothedHeading + diff * 0.15 + 360) % 360;
+        
+            currentHeading = Math.round(smoothedHeading);
             document.getElementById('headingVal').innerText = `${currentHeading}°`;
-
-            // Adjust relative pointer rotation during live heading changes
+        
+            // Rotate directional needle relative to current heading
             const relativeAngle = (bestBearing - currentHeading + 360) % 360;
             document.getElementById('bearingArrow').style.transform = `rotate(${relativeAngle}deg)`;
         }
