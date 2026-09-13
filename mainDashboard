@@ -1,0 +1,280 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0, user-scalable=no">
+    <title>Park Overwatch Command</title>
+    <script src="https://unpkg.com/mqtt/dist/mqtt.min.js"></script>
+    <style>
+        /* Greyscale Minimalist Theme */
+        :root {
+            --bg-color: #f4f4f5;
+            --taskbar-bg: #27272a;
+            --taskbar-text: #e4e4e7;
+            --border-color: #d4d4d8;
+            --sys1-red: #ef4444;
+            --sys2-green: #22c55e;
+        }
+
+        body {
+            margin: 0;
+            padding: 0;
+            display: flex;
+            height: 100vh;
+            font-family: -apple-system, sans-serif;
+            background-color: var(--bg-color);
+            overflow: hidden;
+        }
+
+        /* Taskbar Layout */
+        nav.taskbar {
+            width: 60px;
+            background-color: var(--taskbar-bg);
+            color: var(--taskbar-text);
+            transition: width 0.3s ease;
+            display: flex;
+            flex-direction: column;
+            overflow: hidden;
+            box-shadow: 2px 0 5px rgba(0,0,0,0.1);
+            z-index: 10;
+        }
+
+        nav.taskbar.expanded {
+            width: 200px;
+        }
+
+        .menu-btn {
+            background: none;
+            border: none;
+            color: white;
+            font-size: 24px;
+            padding: 15px;
+            cursor: pointer;
+            text-align: left;
+        }
+
+        .nav-item {
+            display: flex;
+            align-items: center;
+            padding: 15px;
+            white-space: nowrap;
+            border-bottom: 1px solid #3f3f46;
+        }
+
+        .nav-icon {
+            font-weight: bold;
+            font-size: 18px;
+            min-width: 30px;
+        }
+
+        .nav-label {
+            opacity: 0;
+            transition: opacity 0.3s ease;
+            margin-left: 10px;
+        }
+
+        nav.taskbar.expanded .nav-label {
+            opacity: 1;
+        }
+
+        .status-dot {
+            width: 8px;
+            height: 8px;
+            border-radius: 50%;
+            background: #52525b; /* Default offline grey */
+            margin-left: auto;
+        }
+
+        /* Map Main Area */
+        main {
+            flex: 1;
+            position: relative;
+            background: repeating-linear-gradient(45deg, #e4e4e7, #e4e4e7 10px, #f4f4f5 10px, #f4f4f5 20px);
+            display: flex;
+            align-items: center;
+            justify-content: center;
+        }
+
+        .map-box {
+            position: relative;
+            width: 90%;
+            height: 90%;
+            background-color: #d4d4d8; /* Placeholder for your actual image map */
+            border: 2px solid #a1a1aa;
+            border-radius: 8px;
+            overflow: hidden;
+        }
+
+        .map-title {
+            position: absolute;
+            top: 20px;
+            left: 20px;
+            color: #52525b;
+            font-weight: bold;
+            font-size: 24px;
+            letter-spacing: 2px;
+        }
+
+        /* Tracker Dots */
+        .tracker {
+            position: absolute;
+            transform: translate(-50%, -50%);
+            width: 24px;
+            height: 24px;
+            border-radius: 50%;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            color: white;
+            font-weight: bold;
+            font-size: 12px;
+            opacity: 0; /* Hidden by default */
+            transition: opacity 0.3s;
+        }
+
+        /* System 1: Victim (Blinks Red on Emergency) */
+        #victim-dot {
+            top: 40%;
+            left: 30%;
+            background-color: var(--sys1-red);
+        }
+        .emergency-blink {
+            opacity: 1 !important;
+            animation: pulse-red 1s infinite alternate;
+        }
+        @keyframes pulse-red {
+            0% { box-shadow: 0 0 0 0 rgba(239, 68, 68, 0.7); transform: translate(-50%, -50%) scale(1); }
+            100% { box-shadow: 0 0 0 15px rgba(239, 68, 68, 0); transform: translate(-50%, -50%) scale(1.2); }
+        }
+
+        /* System 2: Security (Solid Green) */
+        #security-dot {
+            top: 60%;
+            left: 70%;
+            background-color: var(--sys2-green);
+            opacity: 1; /* Always visible for testing */
+        }
+    </style>
+</head>
+<body>
+
+    <!-- Taskbar / Sidebar -->
+    <nav class="taskbar" id="sidebar">
+        <button class="menu-btn" onclick="toggleTaskbar()">☰</button>
+        
+        <div class="nav-item">
+            <span class="nav-icon">P</span>
+            <span class="nav-label">People (Sys 1)</span>
+            <div class="status-dot" id="dot-sys1"></div>
+        </div>
+        <div class="nav-item">
+            <span class="nav-icon">S</span>
+            <span class="nav-label">Security (Sys 2)</span>
+            <div class="status-dot" id="dot-sys2"></div>
+        </div>
+        <div class="nav-item">
+            <span class="nav-icon">L</span>
+            <span class="nav-label">Light (Sys 3)</span>
+            <div class="status-dot" id="dot-sys3"></div>
+        </div>
+        <div class="nav-item">
+            <span class="nav-icon">B</span>
+            <span class="nav-label">Border (Sys 4)</span>
+            <div class="status-dot" id="dot-sys4"></div>
+        </div>
+    </nav>
+
+    <!-- Main Map Area -->
+    <main>
+        <div class="map-box">
+            <div class="map-title">THEME PARK MAP [IMG PLACEHOLDER]</div>
+            
+            <div id="victim-dot" class="tracker">V</div>
+            <div id="security-dot" class="tracker">S</div>
+        </div>
+    </main>
+
+    <script>
+        // --- UI Logic ---
+        function toggleTaskbar() {
+            document.getElementById('sidebar').classList.toggle('expanded');
+        }
+
+        // --- MQTT Connection Manager ---
+        function createMqttClient(config) {
+            // Generate a random client ID to prevent connection drops
+            const clientId = 'WebUI_' + config.systemName + '_' + Math.random().toString(16).substr(2, 8);
+            const client = mqtt.connect(config.brokerUrl, { clientId: clientId, keepalive: 30 });
+
+            client.on('connect', () => {
+                console.log(config.systemName + " Connected");
+                document.getElementById(config.dotId).style.background = "#22c55e"; // Green dot in taskbar
+                client.subscribe(config.topic);
+            });
+
+            client.on('message', (topic, payload) => {
+                config.onMessage(JSON.parse(payload.toString()));
+            });
+
+            client.on('offline', () => {
+                document.getElementById(config.dotId).style.background = "#ef4444"; // Red dot in taskbar on disconnect
+            });
+
+            return client;
+        }
+
+        // --- Setup 4 Independent MQTT Clients ---
+
+        // System 1: Victim Wearable
+        createMqttClient({
+            systemName: 'Sys1',
+            brokerUrl: 'wss://broker.hivemq.com:8884/mqtt',
+            topic: 'themepark/wristband/data',
+            dotId: 'dot-sys1',
+            onMessage: function(data) {
+                const dot = document.getElementById('victim-dot');
+                // Blink Red on ANY emergency status
+                if (data.status === "MANUAL_SOS" || data.status === "DROWNING_HYPOXIA" || data.status === "TAMPER_REMOVED") {
+                    dot.classList.add('emergency-blink');
+                } else {
+                    dot.classList.remove('emergency-blink');
+                }
+            }
+        });
+
+        // System 2: Security Tracker
+        createMqttClient({
+            systemName: 'Sys2',
+            brokerUrl: 'wss://broker.hivemq.com:8884/mqtt',
+            topic: 'themepark/security/data',
+            dotId: 'dot-sys2',
+            onMessage: function(data) {
+                // Future expansion: Move the security dot based on data.x and data.y here
+                // For now, it stays solid green in a fixed spot as requested
+            }
+        });
+
+        // System 3: Emergency Light (Placeholder for future)
+        createMqttClient({
+            systemName: 'Sys3',
+            brokerUrl: 'wss://broker.hivemq.com:8884/mqtt', // Change when System 3 has a new host
+            topic: 'themepark/light/data',
+            dotId: 'dot-sys3',
+            onMessage: function(data) {
+                console.log("Sys3 Data:", data);
+            }
+        });
+
+        // System 4: Border/Gates (Placeholder for future)
+        createMqttClient({
+            systemName: 'Sys4',
+            brokerUrl: 'wss://broker.hivemq.com:8884/mqtt', // Change when System 4 has a new host
+            topic: 'themepark/border/data',
+            dotId: 'dot-sys4',
+            onMessage: function(data) {
+                console.log("Sys4 Data:", data);
+            }
+        });
+    </script>
+</body>
+</html>
