@@ -1,0 +1,178 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0, user-scalable=no">
+    <title>System 3: Navigation Brain</title>
+    <script src="https://unpkg.com/mqtt/dist/mqtt.min.js"></script>
+    <style>
+        :root { --bg: #090d16; --surface: #131b2e; --cyan: #06b6d4; --red: #ef4444; }
+        body { margin: 0; background: var(--bg); color: #f1f5f9; font-family: sans-serif; display: flex; flex-direction: column; align-items: center; padding: 16px; }
+        header { width: 100%; max-width: 400px; display: flex; justify-content: space-between; align-items: center; margin-bottom: 15px; }
+        .pill { font-size: 0.8rem; padding: 4px 10px; border-radius: 12px; background: #022c22; color: #34d399; }
+        
+        .radar-box { position: relative; width: 300px; height: 300px; border-radius: 50%; border: 2px solid var(--cyan); background: radial-gradient(circle, rgba(6,182,212,0.1) 0%, rgba(9,13,22,0.9) 100%); overflow: hidden; display: flex; align-items: center; justify-content: center; margin-bottom: 20px;}
+        .arrow-pointer { position: absolute; width: 0; height: 0; border-left: 8px solid transparent; border-right: 8px solid transparent; border-bottom: 35px solid var(--red); top: 15px; transform-origin: 50% 135px; transition: transform 0.1s ease-out; filter: drop-shadow(0 0 8px var(--red)); }
+
+        .stats { width: 100%; max-width: 400px; display: grid; grid-template-columns: 1fr 1fr; gap: 10px; margin-bottom: 20px;}
+        .card { background: var(--surface); padding: 12px; border-radius: 8px; border: 1px solid #23304b; text-align: center; }
+        .label { font-size: 0.75rem; color: #94a3b8; }
+        .value { font-size: 1.2rem; font-weight: bold; margin-top: 4px; }
+        
+        button { background: var(--cyan); color: white; border: none; padding: 15px 20px; border-radius: 8px; font-weight: bold; width: 100%; max-width: 400px; margin-bottom: 10px;}
+    </style>
+</head>
+<body>
+
+    <header>
+        <div style="font-weight: 800;">SYS 3: NAV BRAIN</div>
+        <div class="pill" id="mqttStatus">Connecting...</div>
+    </header>
+
+    <div class="radar-box">
+        <div class="arrow-pointer" id="bearingArrow"></div>
+    </div>
+
+    <button id="btnPerm" onclick="requestCompass()">1. Calibrate Compass</button>
+    <button id="btnSweep" onclick="initiateSweep()" style="background: var(--red);">2. Initiate 360° Sweep</button>
+
+    <div class="stats">
+        <div class="card">
+            <div class="label">Live Heading</div>
+            <div class="value" id="headingVal">0°</div>
+        </div>
+        <div class="card">
+            <div class="label">Target Bearing</div>
+            <div class="value" id="bearingVal" style="color: var(--red);">--°</div>
+        </div>
+        <div class="card">
+            <div class="label">Live RSSI</div>
+            <div class="value" id="rssiVal">-- dBm</div>
+        </div>
+        <div class="card">
+            <div class="label">State</div>
+            <div class="value" id="stateVal">IDLE</div>
+        </div>
+    </div>
+
+    <script>
+        let currentHeading = 0;
+        let targetBearing = -1;
+        let isSweeping = false;
+        let isTargeting = false;
+        
+        // 36 Bins (10° resolution) for the 360° Sweep Mapping
+        const NUM_SECTORS = 36;
+        const sectors = new Array(NUM_SECTORS).fill(-120);
+
+        const client = mqtt.connect('wss://broker.hivemq.com:8884/mqtt', { 
+            clientId: 'Sys3Brain_' + Math.random().toString(16).substr(2, 8) 
+        });
+
+        client.on('connect', () => {
+            document.getElementById('mqttStatus').innerText = "System Online";
+            client.subscribe('themepark/light/data');
+        });
+
+        client.on('message', (topic, payload) => {
+            try {
+                const data = JSON.parse(payload.toString());
+                const rawRssi = parseInt(data.rssi);
+                document.getElementById('rssiVal').innerText = `${rawRssi} dBm`;
+
+                // If the table is physically sweeping, map the RSSI to the direction it is currently facing
+                if (isSweeping && rawRssi > -95) {
+                    const sectorIndex = Math.floor(((currentHeading + 5) % 360) / 10);
+                    // Retain the absolute highest signal seen in this 10-degree window
+                    if (rawRssi > sectors[sectorIndex]) {
+                        sectors[sectorIndex] = rawRssi;
+                    }
+                }
+            } catch (e) { console.error("Payload error", e); }
+        });
+
+        function initiateSweep() {
+            sectors.fill(-120);
+            isSweeping = true;
+            document.getElementById('stateVal').innerText = "SWEEPING";
+            client.publish('themepark/system3/command', '{"motor_command": "SWEEP"}');
+
+            // Allow the table to spin for 12 seconds to complete a full 360 degree circle
+            setTimeout(() => {
+                isSweeping = false;
+                calculateTargetAndTurn();
+            }, 12000);
+        }
+
+        function calculateTargetAndTurn() {
+            let maxVal = -120;
+            let peakSector = -1;
+
+            for (let i = 0; i < NUM_SECTORS; i++) {
+                if (sectors[i] > maxVal) {
+                    maxVal = sectors[i];
+                    peakSector = i;
+                }
+            }
+
+            if (peakSector !== -1 && maxVal > -95) {
+                targetBearing = peakSector * 10;
+                document.getElementById('bearingVal').innerText = `${targetBearing}°`;
+                document.getElementById('stateVal').innerText = "TARGETING";
+                
+                // Determine shortest rotation path
+                let diff = (targetBearing - currentHeading + 360) % 360;
+                let command = (diff > 180) ? "TURN_LEFT" : "TURN_RIGHT";
+                
+                isTargeting = true;
+                client.publish('themepark/system3/command', `{"motor_command": "${command}"}`);
+            } else {
+                document.getElementById('stateVal').innerText = "NO SIGNAL";
+                client.publish('themepark/system3/command', '{"motor_command": "STOP"}');
+            }
+        }
+
+        function requestCompass() {
+            if (typeof DeviceOrientationEvent !== 'undefined' && typeof DeviceOrientationEvent.requestPermission === 'function') {
+                DeviceOrientationEvent.requestPermission().then(response => {
+                    if (response === 'granted') {
+                        window.addEventListener('deviceorientation', handleOrientation, true);
+                        document.getElementById('btnPerm').style.display = 'none';
+                    }
+                }).catch(console.error);
+            } else {
+                window.addEventListener('deviceorientationabsolute', handleOrientation, true);
+                window.addEventListener('deviceorientation', handleOrientation, true);
+                document.getElementById('btnPerm').style.display = 'none';
+            }
+        }
+
+        function handleOrientation(e) {
+            let compass = 0;
+            if (e.webkitCompassHeading) compass = e.webkitCompassHeading;
+            else if (e.alpha !== null) compass = (360 - e.alpha) % 360; 
+
+            // Smooth the compass to prevent jitter
+            currentHeading = Math.round(compass);
+            document.getElementById('headingVal').innerText = `${currentHeading}°`;
+
+            if (targetBearing !== -1) {
+                const relativeAngle = (targetBearing - currentHeading + 360) % 360;
+                document.getElementById('bearingArrow').style.transform = `rotate(${relativeAngle}deg)`;
+
+                // If in Targeting Phase and we hit the exact bearing (+/- 3 degrees for inertia), STOP!
+                if (isTargeting) {
+                    let offTarget = Math.abs(currentHeading - targetBearing);
+                    if (offTarget > 180) offTarget = 360 - offTarget;
+                    
+                    if (offTarget <= 3) {
+                        isTargeting = false;
+                        document.getElementById('stateVal').innerText = "LOCKED";
+                        client.publish('themepark/system3/command', '{"motor_command": "STOP"}');
+                    }
+                }
+            }
+        }
+    </script>
+</body>
+</html>
