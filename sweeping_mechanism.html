@@ -11,9 +11,7 @@
         header { width: 100%; max-width: 400px; display: flex; justify-content: space-between; align-items: center; margin-bottom: 15px; }
         .pill { font-size: 0.8rem; padding: 4px 10px; border-radius: 12px; background: #022c22; color: #34d399; }
         
-        /* CCTV Video Feed */
         #cctvFeed { width: 100%; max-width: 400px; height: 220px; background: #000; border-radius: 8px; border: 2px solid var(--surface); margin-bottom: 15px; object-fit: cover; }
-
         .radar-box { position: relative; width: 300px; height: 300px; border-radius: 50%; border: 2px solid var(--cyan); background: radial-gradient(circle, rgba(6,182,212,0.1) 0%, rgba(9,13,22,0.9) 100%); overflow: hidden; display: flex; align-items: center; justify-content: center; margin-bottom: 20px;}
         .arrow-pointer { position: absolute; width: 0; height: 0; border-left: 8px solid transparent; border-right: 8px solid transparent; border-bottom: 35px solid var(--red); top: 15px; transform-origin: 50% 135px; transition: transform 0.1s ease-out; filter: drop-shadow(0 0 8px var(--red)); }
 
@@ -32,15 +30,13 @@
         <div class="pill" id="mqttStatus">Connecting...</div>
     </header>
 
-    <!-- Camera Feed -->
     <video id="cctvFeed" autoplay playsinline muted></video>
 
     <div class="radar-box">
         <div class="arrow-pointer" id="bearingArrow"></div>
     </div>
 
-    <!-- Single click required by browsers to grant camera and compass access -->
-    <button id="btnInit" onclick="initializeSystem()">INITIALIZE SYSTEM (GRANT PERMISSIONS)</button>
+    <button id="btnInit">INITIALIZE SYSTEM (GRANT PERMISSIONS)</button>
 
     <div class="stats">
         <div class="card">
@@ -62,153 +58,227 @@
     </div>
 
     <script>
-        let currentHeading = 0;
-        let targetBearing = -1;
-        let isSweeping = false;
-        let isTargeting = false;
-        
-        const NUM_SECTORS = 36;
-        const sectors = new Array(NUM_SECTORS).fill(-120);
+        // Encapsulate all logic to prevent global variable leakage (Rule 6, 9)
+        (function() {
+            "use strict";
 
-        const client = mqtt.connect('wss://broker.hivemq.com:8884/mqtt', { 
-            clientId: 'Sys3Brain_' + Math.random().toString(16).substr(2, 8) 
-        });
+            // --- FIXED BOUNDS & STATE (Rule 2, 3) ---
+            const NUM_SECTORS = 36;
+            const STATE = {
+                heading: 0,
+                target: -1,
+                sweeping: false,
+                targeting: false,
+                sectors: new Array(NUM_SECTORS).fill(-120) // Pre-allocated, no dynamic pushing
+            };
 
-        client.on('connect', () => {
-            document.getElementById('mqttStatus').innerText = "System Online";
-            client.subscribe('themepark/light/data');
-            client.subscribe('themepark/wristband/data'); // Listen for System 1 triggers
-        });
+            let mqttClient = null;
 
-        client.on('message', (topic, payload) => {
-            try {
-                const message = payload.toString();
-                const data = JSON.parse(message);
+            // --- SAFE DOM UPDATER (Rule 5, 7) ---
+            function safeUpdateDOM(elementId, textValue, colorValue) {
+                console.assert(elementId !== null && elementId !== "", "safeUpdateDOM: Invalid elementId");
+                const el = document.getElementById(elementId);
+                if (el !== null) {
+                    if (textValue !== null) el.innerText = textValue;
+                    if (colorValue !== null) el.style.color = colorValue;
+                } else {
+                    console.error("DOM element missing: " + elementId);
+                }
+            }
 
-                // --- AUTOMATED TRIGGER LOGIC ---
-                if (topic === 'themepark/wristband/data') {
-                    if (data.status !== "NORMAL" && !isSweeping && !isTargeting) {
-                        // Emergency detected: Automatically start the calibration sweep
-                        initiateSweep();
-                    } else if (data.status === "NORMAL" && (isSweeping || isTargeting)) {
-                        // Disarm command received
-                        resetSystem();
-                    }
+            // --- MQTT INITIALIZATION ---
+            function initMQTT() {
+                const clientId = 'Sys3Brain_' + Math.random().toString(16).substr(2, 8);
+                mqttClient = mqtt.connect('wss://broker.hivemq.com:8884/mqtt', { clientId: clientId });
+
+                mqttClient.on('connect', function() {
+                    safeUpdateDOM('mqttStatus', "System Online", null);
+                    mqttClient.subscribe('themepark/light/data');
+                    mqttClient.subscribe('themepark/wristband/data');
+                });
+
+                mqttClient.on('message', handleMqttMessage);
+            }
+
+            // --- MESSAGE PARSING & VALIDATION (Rule 4, 8) ---
+            function handleMqttMessage(topic, payload) {
+                console.assert(topic !== null, "handleMqttMessage: topic is null");
+                console.assert(payload !== null, "handleMqttMessage: payload is null");
+
+                if (!payload) return;
+
+                let data = null;
+                try {
+                    data = JSON.parse(payload.toString());
+                } catch (e) {
+                    console.error("Invalid JSON payload ignored.");
+                    return; // Graceful exit on bad data (Rule 8)
                 }
 
-                // --- RSSI SCANNING LOGIC ---
-                if (topic === 'themepark/light/data') {
-                    const rawRssi = parseInt(data.rssi);
-                    document.getElementById('rssiVal').innerText = `${rawRssi} dBm`;
+                if (topic === 'themepark/wristband/data') {
+                    processWristbandData(data);
+                } else if (topic === 'themepark/light/data') {
+                    processLightData(data);
+                }
+            }
 
-                    if (isSweeping && rawRssi > -95) {
-                        const sectorIndex = Math.floor(((currentHeading + 5) % 360) / 10);
-                        if (rawRssi > sectors[sectorIndex]) {
-                            sectors[sectorIndex] = rawRssi;
+            // --- WRISTBAND LOGIC (Rule 4) ---
+            function processWristbandData(data) {
+                if (typeof data.status !== 'string') return; // Parameter validation (Rule 8)
+
+                if (data.status !== "NORMAL" && !STATE.sweeping && !STATE.targeting) {
+                    executeSweep();
+                } else if (data.status === "NORMAL" && (STATE.sweeping || STATE.targeting)) {
+                    resetSystemState();
+                }
+            }
+
+            // --- RSSI PROCESSING LOGIC (Rule 4) ---
+            function processLightData(data) {
+                if (data.rssi === undefined || data.rssi === null) return;
+
+                const rawRssi = parseInt(data.rssi, 10);
+                if (isNaN(rawRssi)) return; // Parameter validation (Rule 8)
+
+                safeUpdateDOM('rssiVal', `${rawRssi} dBm`, null);
+
+                if (STATE.sweeping && rawRssi > -95) {
+                    const sectorIndex = Math.floor(((STATE.heading + 5) % 360) / 10);
+                    console.assert(sectorIndex >= 0 && sectorIndex < NUM_SECTORS, "Sector index out of bounds");
+                    
+                    if (sectorIndex >= 0 && sectorIndex < NUM_SECTORS) {
+                        if (rawRssi > STATE.sectors[sectorIndex]) {
+                            STATE.sectors[sectorIndex] = rawRssi;
                         }
                     }
                 }
-            } catch (e) { console.error("Payload error", e); }
-        });
-
-        async function initializeSystem() {
-            // 1. Start CCTV Camera
-            try {
-                const stream = await navigator.mediaDevices.getUserMedia({ video: { facingMode: "environment" } });
-                document.getElementById('cctvFeed').srcObject = stream;
-            } catch (err) { console.error("Camera access denied", err); }
-
-            // 2. Request Compass
-            if (typeof DeviceOrientationEvent !== 'undefined' && typeof DeviceOrientationEvent.requestPermission === 'function') {
-                DeviceOrientationEvent.requestPermission().then(response => {
-                    if (response === 'granted') {
-                        window.addEventListener('deviceorientation', handleOrientation, true);
-                    }
-                }).catch(console.error);
-            } else {
-                window.addEventListener('deviceorientationabsolute', handleOrientation, true);
-                window.addEventListener('deviceorientation', handleOrientation, true);
             }
 
-            document.getElementById('btnInit').style.display = 'none';
-            document.getElementById('stateVal').innerText = "STANDBY";
-            document.getElementById('stateVal').style.color = "#34d399"; // Green
-        }
-
-        function initiateSweep() {
-            sectors.fill(-120);
-            isSweeping = true;
-            document.getElementById('stateVal').innerText = "AUTO-SWEEPING";
-            document.getElementById('stateVal').style.color = "var(--red)";
-            client.publish('themepark/system3/command', '{"motor_command": "SWEEP"}');
-
-            setTimeout(() => {
-                isSweeping = false;
-                calculateTargetAndTurn();
-            }, 12000);
-        }
-
-        function calculateTargetAndTurn() {
-            let maxVal = -120;
-            let peakSector = -1;
-
-            for (let i = 0; i < NUM_SECTORS; i++) {
-                if (sectors[i] > maxVal) {
-                    maxVal = sectors[i];
-                    peakSector = i;
+            // --- ACTUATOR CONTROL (Rule 4) ---
+            function executeSweep() {
+                STATE.sectors.fill(-120);
+                STATE.sweeping = true;
+                
+                safeUpdateDOM('stateVal', "AUTO-SWEEPING", "#ef4444");
+                
+                if (mqttClient && mqttClient.connected) {
+                    mqttClient.publish('themepark/system3/command', '{"motor_command": "SWEEP"}');
                 }
+
+                setTimeout(calculateTargetAndTurn, 12000);
             }
 
-            if (peakSector !== -1 && maxVal > -95) {
-                targetBearing = peakSector * 10;
-                document.getElementById('bearingVal').innerText = `${targetBearing}°`;
-                document.getElementById('stateVal').innerText = "TARGETING";
-                
-                let diff = (targetBearing - currentHeading + 360) % 360;
-                let command = (diff > 180) ? "TURN_LEFT" : "TURN_RIGHT";
-                
-                isTargeting = true;
-                client.publish('themepark/system3/command', `{"motor_command": "${command}"}`);
-            } else {
-                document.getElementById('stateVal').innerText = "NO SIGNAL";
-                client.publish('themepark/system3/command', '{"motor_command": "STOP"}');
-                setTimeout(resetSystem, 5000); // Reset after 5 seconds if failed
-            }
-        }
+            function calculateTargetAndTurn() {
+                STATE.sweeping = false;
+                let maxVal = -120;
+                let peakSector = -1;
 
-        function handleOrientation(e) {
-            let compass = 0;
-            if (e.webkitCompassHeading) compass = e.webkitCompassHeading;
-            else if (e.alpha !== null) compass = (360 - e.alpha) % 360; 
+                // Bounded loop (Rule 2)
+                for (let i = 0; i < NUM_SECTORS; i++) {
+                    if (STATE.sectors[i] > maxVal) {
+                        maxVal = STATE.sectors[i];
+                        peakSector = i;
+                    }
+                }
 
-            currentHeading = Math.round(compass);
-            document.getElementById('headingVal').innerText = `${currentHeading}°`;
-
-            if (targetBearing !== -1) {
-                const relativeAngle = (targetBearing - currentHeading + 360) % 360;
-                document.getElementById('bearingArrow').style.transform = `rotate(${relativeAngle}deg)`;
-
-                if (isTargeting) {
-                    let offTarget = Math.abs(currentHeading - targetBearing);
-                    if (offTarget > 180) offTarget = 360 - offTarget;
+                if (peakSector !== -1 && maxVal > -95) {
+                    STATE.target = peakSector * 10;
+                    safeUpdateDOM('bearingVal', `${STATE.target}°`, null);
+                    safeUpdateDOM('stateVal', "TARGETING", null);
                     
-                    if (offTarget <= 3) {
-                        isTargeting = false;
-                        document.getElementById('stateVal').innerText = "LOCKED";
-                        client.publish('themepark/system3/command', '{"motor_command": "STOP"}');
+                    const diff = (STATE.target - STATE.heading + 360) % 360;
+                    const command = (diff > 180) ? "TURN_LEFT" : "TURN_RIGHT";
+                    
+                    STATE.targeting = true;
+                    if (mqttClient && mqttClient.connected) {
+                        mqttClient.publish('themepark/system3/command', `{"motor_command": "${command}"}`);
+                    }
+                } else {
+                    safeUpdateDOM('stateVal', "NO SIGNAL", null);
+                    if (mqttClient && mqttClient.connected) {
+                        mqttClient.publish('themepark/system3/command', '{"motor_command": "STOP"}');
+                    }
+                    setTimeout(resetSystemState, 5000);
+                }
+            }
+
+            function resetSystemState() {
+                STATE.sweeping = false;
+                STATE.targeting = false;
+                STATE.target = -1;
+                safeUpdateDOM('bearingVal', "--°", null);
+                safeUpdateDOM('stateVal', "STANDBY", "#34d399");
+            }
+
+            // --- HARDWARE SENSORS ---
+            function handleOrientation(e) {
+                console.assert(e !== null, "handleOrientation: event is null");
+                
+                let compass = 0;
+                if (e.webkitCompassHeading !== undefined && e.webkitCompassHeading !== null) {
+                    compass = e.webkitCompassHeading;
+                } else if (e.alpha !== null) {
+                    compass = (360 - e.alpha) % 360;
+                } 
+
+                STATE.heading = Math.round(compass);
+                safeUpdateDOM('headingVal', `${STATE.heading}°`, null);
+
+                if (STATE.target !== -1) {
+                    const relativeAngle = (STATE.target - STATE.heading + 360) % 360;
+                    const arrowEl = document.getElementById('bearingArrow');
+                    if (arrowEl !== null) arrowEl.style.transform = `rotate(${relativeAngle}deg)`;
+
+                    if (STATE.targeting) {
+                        let offTarget = Math.abs(STATE.heading - STATE.target);
+                        if (offTarget > 180) offTarget = 360 - offTarget;
+                        
+                        if (offTarget <= 3) {
+                            STATE.targeting = false;
+                            safeUpdateDOM('stateVal', "LOCKED", null);
+                            if (mqttClient && mqttClient.connected) {
+                                mqttClient.publish('themepark/system3/command', '{"motor_command": "STOP"}');
+                            }
+                        }
                     }
                 }
             }
-        }
 
-        function resetSystem() {
-            isSweeping = false;
-            isTargeting = false;
-            targetBearing = -1;
-            document.getElementById('bearingVal').innerText = "--°";
-            document.getElementById('stateVal').innerText = "STANDBY";
-            document.getElementById('stateVal').style.color = "#34d399";
-        }
+            async function initializeHardware() {
+                try {
+                    const stream = await navigator.mediaDevices.getUserMedia({ video: { facingMode: "environment" } });
+                    const videoEl = document.getElementById('cctvFeed');
+                    if (videoEl !== null) videoEl.srcObject = stream;
+                } catch (err) { 
+                    console.error("Camera denied", err); 
+                }
+
+                if (typeof DeviceOrientationEvent !== 'undefined' && typeof DeviceOrientationEvent.requestPermission === 'function') {
+                    DeviceOrientationEvent.requestPermission().then(response => {
+                        if (response === 'granted') {
+                            window.addEventListener('deviceorientation', handleOrientation, true);
+                        }
+                    }).catch(console.error);
+                } else {
+                    window.addEventListener('deviceorientationabsolute', handleOrientation, true);
+                    window.addEventListener('deviceorientation', handleOrientation, true);
+                }
+
+                const btn = document.getElementById('btnInit');
+                if (btn !== null) btn.style.display = 'none';
+                
+                safeUpdateDOM('stateVal', "STANDBY", "#34d399");
+                initMQTT();
+            }
+
+            // Event Listener Binding
+            const initButton = document.getElementById('btnInit');
+            console.assert(initButton !== null, "Init button missing from DOM");
+            if (initButton !== null) {
+                initButton.addEventListener('click', initializeHardware);
+            }
+
+        })();
     </script>
 </body>
 </html>
